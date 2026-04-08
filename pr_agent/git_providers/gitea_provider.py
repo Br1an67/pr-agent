@@ -343,6 +343,7 @@ class GiteaProvider(GitProvider):
                 self.publish_inline_comments([payload],title_body)
             else:
                 self.publish_inline_comments([payload])
+        return True
 
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
         """Add eyes reaction to a comment"""
