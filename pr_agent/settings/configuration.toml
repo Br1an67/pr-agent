@@ -139,6 +139,8 @@ enable_chat_text=false
 persistent_comment=true
 max_history_len=4
 publish_output_no_suggestions=true
+# prompt-to-fix: add a collapsible block with copy-paste prompt for AI tools (Cursor, Copilot, Claude)
+enable_prompt_to_fix=false
 # suggestions scoring
 suggestions_score_threshold=0 # [0-10]| recommend not to set this value above 8, since above it may clip highly relevant suggestions
 new_score_mechanism=true

@@ -565,6 +565,15 @@ class PRCodeSuggestions:
                     body = f"**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n" + new_code_snippet + "\n```"
                 else:
                     body = f"**Suggestion:** {content} [{label}]\n```suggestion\n" + new_code_snippet + "\n```"
+
+                # Append Prompt-to-Fix block to inline comment
+                if get_settings().get('pr_code_suggestions.enable_prompt_to_fix', False):
+                    one_sentence_summary = d.get('one_sentence_summary', content)
+                    body += self._generate_prompt_to_fix(
+                        relevant_file, f"[{relevant_lines_start}-{relevant_lines_end}]",
+                        relevant_lines_start, relevant_lines_end,
+                        one_sentence_summary, content, new_code_snippet)
+
                 code_suggestions.append({'body': body, 'relevant_file': relevant_file,
                                          'relevant_lines_start': relevant_lines_start,
                                          'relevant_lines_end': relevant_lines_end,
@@ -870,6 +879,13 @@ class PRCodeSuggestions:
                         pr_body += f"</details>"
 
                     pr_body += f"</details>"
+                    # Prompt-to-Fix: collapsible block with copy-paste prompt for AI tools
+                    if get_settings().get('pr_code_suggestions.enable_prompt_to_fix', False):
+                        prompt_to_fix = self._generate_prompt_to_fix(
+                            relevant_file, range_str,
+                            relevant_lines_start, relevant_lines_end,
+                            suggestion_summary, suggestion_content, improved_code)
+                        pr_body += prompt_to_fix
 
                     # # add another column for 'score'
                     score_int = int(suggestion.get('score', 0))
@@ -898,6 +914,34 @@ class PRCodeSuggestions:
             return "Medium"
         else:  # score < 7
             return "Low"
+
+
+    @staticmethod
+    def _generate_prompt_to_fix(relevant_file, range_str, relevant_lines_start, relevant_lines_end,
+                                suggestion_summary, suggestion_content, improved_code):
+        """Generate a collapsible 'Prompt To Fix With AI' block for a suggestion."""
+        line_ref = f"{relevant_lines_start}" if relevant_lines_start == relevant_lines_end \
+            else f"{relevant_lines_start}-{relevant_lines_end}"
+
+        prompt_block = "\n\n<details><summary>Prompt To Fix With AI</summary>\n\n"
+        prompt_block += "```text\n"
+        prompt_block += "This is a comment left during a code review.\n"
+        prompt_block += f"Path: {relevant_file}\n"
+        prompt_block += f"Line: {line_ref}\n"
+        prompt_block += "\n"
+        prompt_block += "Comment:\n"
+        prompt_block += f"**{suggestion_summary}**\n"
+        prompt_block += "\n"
+        prompt_block += f"{suggestion_content}\n"
+        prompt_block += "\n"
+        if improved_code.strip():
+            prompt_block += "Suggested fix:\n"
+            prompt_block += f"{improved_code.rstrip()}\n"
+            prompt_block += "\n"
+        prompt_block += "How can I resolve this? If you propose a fix, please make it concise.\n"
+        prompt_block += "```\n"
+        prompt_block += "</details>"
+        return prompt_block
 
     async def self_reflect_on_suggestions(self,
                                           suggestion_list: List,
