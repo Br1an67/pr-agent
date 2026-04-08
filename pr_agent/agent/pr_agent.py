@@ -46,7 +46,6 @@ command2class = {
 commands = list(command2class.keys())
 
 
-
 class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.ai_handler = ai_handler  # will be initialized in run_action
@@ -67,33 +66,33 @@ class PRAgent:
         # validate args
         is_valid, arg = CliArgs.validate_user_args(args)
         if not is_valid:
-            get_logger().error(
-                f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file."
-            )
+            get_logger().error(f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file.")
             return False
 
         # Update settings from args
         args = update_settings_from_args(args)
 
         # Append the response language in the extra instructions
-        response_language = get_settings().config.get('response_language', 'en-us')
-        if response_language.lower() != 'en-us':
-            get_logger().info(f'User has set the response language to: {response_language}')
+        response_language = get_settings().config.get("response_language", "en-us")
+        if response_language.lower() != "en-us":
+            get_logger().info(f"User has set the response language to: {response_language}")
             for key in get_settings():
                 setting = get_settings().get(key)
                 if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
-                    if hasattr(setting, 'extra_instructions'):
+                    if hasattr(setting, "extra_instructions"):
                         current_extra_instructions = setting.extra_instructions
-                        
+
                         # Define the language-specific instruction and the separator
                         lang_instruction_text = f"Your response MUST be written in the language corresponding to locale code: '{response_language}'. This is crucial."
                         separator_text = "\n======\n\nIn addition, "
 
                         # Check if the specific language instruction is already present to avoid duplication
                         if lang_instruction_text not in str(current_extra_instructions):
-                            if current_extra_instructions: # If there's existing text
-                                setting.extra_instructions = str(current_extra_instructions) + separator_text + lang_instruction_text
-                            else: # If extra_instructions was None or empty
+                            if current_extra_instructions:  # If there's existing text
+                                setting.extra_instructions = (
+                                    str(current_extra_instructions) + separator_text + lang_instruction_text
+                                )
+                            else:  # If extra_instructions was None or empty
                                 setting.extra_instructions = lang_instruction_text
                         # If lang_instruction_text is already present, do nothing.
 
@@ -102,18 +101,30 @@ class PRAgent:
             get_logger().warning(f"Unknown command: {action}")
             return False
         with get_logger().contextualize(command=action, pr_url=pr_url):
-            get_logger().info("PR-Agent request handler started", analytics=True)
+            get_logger().info(f"PR-Agent request handler started, action={action}", analytics=True)
             if action == "answer":
                 if notify:
                     notify()
-                await PRReviewer(pr_url, is_answer=True, args=args, ai_handler=self.ai_handler).run()
+                get_logger().info(f"Creating PRReviewer(answer) for {pr_url}")
+                reviewer = PRReviewer(pr_url, is_answer=True, args=args, ai_handler=self.ai_handler)
+                get_logger().info("PRReviewer created (answer), calling run()")
+                await reviewer.run()
+                get_logger().info("PRReviewer.run() completed (answer)")
             elif action == "auto_review":
-                await PRReviewer(pr_url, is_auto=True, args=args, ai_handler=self.ai_handler).run()
+                get_logger().info(f"Creating PRReviewer(auto) for {pr_url}")
+                reviewer = PRReviewer(pr_url, is_auto=True, args=args, ai_handler=self.ai_handler)
+                get_logger().info("PRReviewer created (auto), calling run()")
+                await reviewer.run()
+                get_logger().info("PRReviewer.run() completed (auto)")
             elif action in command2class:
                 if notify:
                     notify()
-
-                await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
+                cls_name = command2class[action].__name__
+                get_logger().info(f"Creating {cls_name} for {pr_url}")
+                tool_instance = command2class[action](pr_url, ai_handler=self.ai_handler, args=args)
+                get_logger().info(f"{cls_name} created, calling run()")
+                await tool_instance.run()
+                get_logger().info(f"{cls_name}.run() completed")
             else:
                 return False
             return True
