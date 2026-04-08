@@ -20,12 +20,16 @@ from pr_agent.servers.utils import verify_signature
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
 
+
 @router.post("/api/v1/gitea_webhooks")
 async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Request, response: Response):
     """Handle incoming Gitea webhook requests"""
-    get_logger().debug("Received a Gitea webhook")
+    event_type = request.headers.get("X-Gitea-Event", "unknown")
+    get_logger().info(f"Received a Gitea webhook, event={event_type}")
 
     body = await get_body(request)
+    action = body.get("action", "N/A")
+    get_logger().info(f"Webhook body action={action}, keys={list(body.keys())[:10]}")
 
     # Set context for the request
     context["settings"] = copy.deepcopy(global_settings)
@@ -35,20 +39,20 @@ async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Requ
     background_tasks.add_task(handle_request, body, event=request.headers.get("X-Gitea-Event", None))
     return {}
 
+
 async def get_body(request: Request):
     """Parse and verify webhook request body"""
     try:
         body = await request.json()
     except Exception as e:
-        get_logger().error("Error parsing request body", artifact={'error': e})
+        get_logger().error("Error parsing request body", artifact={"error": e})
         raise HTTPException(status_code=400, detail="Error parsing request body") from e
 
-
     # Verify webhook signature
-    webhook_secret = getattr(get_settings().gitea, 'webhook_secret', None)
+    webhook_secret = getattr(get_settings().gitea, "webhook_secret", None)
     if webhook_secret:
         body_bytes = await request.body()
-        signature_header = request.headers.get('x-gitea-signature', None)
+        signature_header = request.headers.get("x-gitea-signature", None)
         if not signature_header:
             get_logger().error("Missing signature header")
             raise HTTPException(status_code=400, detail="Missing signature header")
@@ -61,27 +65,37 @@ async def get_body(request: Request):
 
     return body
 
+
 async def handle_request(body: Dict[str, Any], event: str):
     """Process Gitea webhook events"""
-    action = body.get("action")
-    if not action:
-        get_logger().debug("No action found in request body")
+    try:
+        action = body.get("action")
+        if not action:
+            get_logger().debug("No action found in request body")
+            return {}
+
+        get_logger().info(f"handle_request: event={event}, action={action}")
+        agent = PRAgent()
+
+        # Handle different event types
+        if event == "pull_request":
+            if not should_process_pr_logic(body):
+                get_logger().debug(f"Request ignored: PR logic filtering")
+                return {}
+            if action in ["opened", "reopened", "synchronized"]:
+                await handle_pr_event(body, event, action, agent)
+        elif event == "issue_comment":
+            if action == "created":
+                await handle_comment_event(body, event, action, agent)
+
+        return {}
+    except Exception as e:
+        get_logger().error(f"Error in handle_request: {e}", exc_info=True)
+        import traceback
+
+        get_logger().error(f"Traceback: {traceback.format_exc()}")
         return {}
 
-    agent = PRAgent()
-
-    # Handle different event types
-    if event == "pull_request":
-        if not should_process_pr_logic(body):
-            get_logger().debug(f"Request ignored: PR logic filtering")
-            return {}
-        if action in ["opened", "reopened", "synchronized"]:
-            await handle_pr_event(body, event, action, agent)
-    elif event == "issue_comment":
-        if action == "created":
-            await handle_comment_event(body, event, action, agent)
-
-    return {}
 
 async def handle_pr_event(body: Dict[str, Any], event: str, action: str, agent: PRAgent):
     """Handle pull request events"""
@@ -106,33 +120,61 @@ async def handle_pr_event(body: Dict[str, Any], event: str, action: str, agent: 
         if not commands_on_push or not handle_push_trigger:
             get_logger().info("Push event, but no push commands found or push trigger is disabled")
             return
-        get_logger().debug(f'A push event has been received: {api_url}')
+        get_logger().debug(f"A push event has been received: {api_url}")
         await _perform_commands_gitea("push_commands", agent, body, api_url)
         # for command in commands_on_push:
         #     await agent.handle_request(api_url, command)
 
+
 async def handle_comment_event(body: Dict[str, Any], event: str, action: str, agent: PRAgent):
     """Handle comment events"""
-    comment = body.get("comment", {})
-    if not comment:
-        return
+    try:
+        comment = body.get("comment", {})
+        if not comment:
+            get_logger().info("No comment in body")
+            return
 
-    comment_body = comment.get("body", "")
-    if not comment_body or not comment_body.startswith("/"):
-        return
+        comment_body = comment.get("body", "")
+        get_logger().info(f"Comment body: {comment_body}")
+        if not comment_body or not comment_body.startswith("/"):
+            get_logger().info("Comment does not start with /")
+            return
 
-    pr_url = body.get("pull_request", {}).get("url")
-    if not pr_url:
-        return
+        pr_url = body.get("pull_request", {}).get("url")
+        get_logger().info(f"PR URL from webhook: {pr_url}")
+        if not pr_url:
+            get_logger().info("No PR URL found, checking issue")
+            # Try to construct PR URL from issue data
+            issue = body.get("issue", {})
+            if issue and issue.get("pull_request"):
+                repo = body.get("repository", {})
+                repo_url = repo.get("html_url", "")
+                issue_number = issue.get("number")
+                if repo_url and issue_number:
+                    pr_url = f"{repo_url}/pulls/{issue_number}"
+                    get_logger().info(f"Constructed PR URL: {pr_url}")
+            if not pr_url:
+                get_logger().error("Could not determine PR URL")
+                return
 
-    await agent.handle_request(pr_url, comment_body)
+        get_logger().info(f"Calling agent.handle_request with pr_url={pr_url}, command={comment_body}")
+        await agent.handle_request(pr_url, comment_body)
+        get_logger().info(f"agent.handle_request completed for {comment_body}")
+    except Exception as e:
+        get_logger().error(f"Error in handle_comment_event: {e}", exc_info=True)
+        import traceback
+
+        get_logger().error(f"Traceback: {traceback.format_exc()}")
+
 
 async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict, api_url: str):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    if (
+        commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback
+    ):  # auto commands for PR, and auto feedback is disabled
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
         return
-    if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
+    if not should_process_pr_logic(body):  # Here we already updated the configuration with the repo settings
         return {}
     commands = get_settings().get(f"gitea.{commands_conf}")
     if not commands:
@@ -144,9 +186,10 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
         command = split_command[0]
         args = split_command[1:]
         other_args = update_settings_from_args(args)
-        new_command = ' '.join([command] + other_args)
+        new_command = " ".join([command] + other_args)
         get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
         await agent.handle_request(api_url, new_command)
+
 
 def should_process_pr_logic(body) -> bool:
     try:
@@ -162,7 +205,9 @@ def should_process_pr_logic(body) -> bool:
         ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
         if ignore_repos and repo_full_name:
             if any(re.search(regex, repo_full_name) for regex in ignore_repos):
-                get_logger().info(f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
+                get_logger().info(
+                    f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting"
+                )
                 return False
 
         # logic to ignore PRs from specific users
@@ -184,7 +229,7 @@ def should_process_pr_logic(body) -> bool:
         # logic to ignore PRs with specific labels or source branches or target branches.
         ignore_pr_labels = get_settings().get("CONFIG.IGNORE_PR_LABELS", [])
         if pr_labels and ignore_pr_labels:
-            labels = [label['name'] for label in pr_labels]
+            labels = [label["name"] for label in pr_labels]
             if any(label in ignore_pr_labels for label in labels):
                 labels_str = ", ".join(labels)
                 get_logger().info(f"Ignoring PR with labels '{labels_str}' due to config.ignore_pr_labels settings")
@@ -196,26 +241,32 @@ def should_process_pr_logic(body) -> bool:
         if pull_request and (ignore_pr_source_branches or ignore_pr_target_branches):
             if any(re.search(regex, source_branch) for regex in ignore_pr_source_branches):
                 get_logger().info(
-                    f"Ignoring PR with source branch '{source_branch}' due to config.ignore_pr_source_branches settings")
+                    f"Ignoring PR with source branch '{source_branch}' due to config.ignore_pr_source_branches settings"
+                )
                 return False
             if any(re.search(regex, target_branch) for regex in ignore_pr_target_branches):
                 get_logger().info(
-                    f"Ignoring PR with target branch '{target_branch}' due to config.ignore_pr_target_branches settings")
+                    f"Ignoring PR with target branch '{target_branch}' due to config.ignore_pr_target_branches settings"
+                )
                 return False
     except Exception as e:
         get_logger().error(f"Failed 'should_process_pr_logic': {e}")
     return True
+
 
 # FastAPI app setup
 middleware = [Middleware(RawContextMiddleware)]
 app = FastAPI(middleware=middleware)
 app.include_router(router)
 
+
 def start():
     """Start the Gitea webhook server"""
     port = int(os.environ.get("PORT", "3000"))
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 if __name__ == "__main__":
     start()
