@@ -37,6 +37,14 @@ FROM base AS gitea_app
 ADD pr_agent pr_agent
 CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py","pr_agent.servers.gitea_app:app"]
 
+FROM gitea_app AS devstar_gitea_app
+RUN mkdir -p /tmp/tiktoken_cache && \
+    curl -fsSL "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" \
+        -o /tmp/tiktoken_cache/fb374d419588a4632f3f557e76b4b70aebbca790 && \
+    curl -fsSL "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" \
+        -o /tmp/tiktoken_cache/9b5ad71b2ce5302211f9c61530b329a4922fc6a4
+ENV TIKTOKEN_CACHE_DIR=/tmp/tiktoken_cache
+
 
 FROM base AS test
 ADD requirements-dev.txt .

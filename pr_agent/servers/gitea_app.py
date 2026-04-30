@@ -19,6 +19,8 @@ from pr_agent.servers.utils import verify_signature
 # Setup logging and router
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
+PR_EVENTS = {"pull_request", "pull_request_sync"}
+COMMENT_EVENTS = {"issue_comment", "pull_request_comment"}
 
 
 @router.post("/api/v1/gitea_webhooks")
@@ -78,13 +80,13 @@ async def handle_request(body: Dict[str, Any], event: str):
         agent = PRAgent()
 
         # Handle different event types
-        if event == "pull_request":
+        if event in PR_EVENTS:
             if not should_process_pr_logic(body):
                 get_logger().debug(f"Request ignored: PR logic filtering")
                 return {}
             if action in ["opened", "reopened", "synchronized"]:
                 await handle_pr_event(body, event, action, agent)
-        elif event == "issue_comment":
+        elif event in COMMENT_EVENTS:
             if action == "created":
                 await handle_comment_event(body, event, action, agent)
 
