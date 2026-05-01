@@ -1,4 +1,6 @@
 import json
+from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
@@ -9,7 +11,8 @@ from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.language_handler import is_valid_file
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import (clip_tokens,
-                                 find_line_number_of_relevant_line_in_file)
+                                 find_line_number_of_relevant_line_in_file,
+                                 PRReviewHeader)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import (MAX_FILES_ALLOWED_FULL,
                                                  FilePatchInfo, GitProvider,
@@ -86,11 +89,12 @@ class GiteaProvider(GitProvider):
             self.sha = self.pr.head.sha if self.pr.head.sha else ""
             self.__add_file_content()
             self.__add_file_diff()
-            self.pr_commits = self.repo_api.list_all_commits(
+            self.pr_commits = self._normalize_commits(self.repo_api.get_pr_commits(
                 owner=self.owner,
-                repo=self.repo
-            )
-            self.last_commit = self.pr_commits[-1]
+                repo=self.repo,
+                pr_number=self.pr_number
+            ))
+            self.last_commit = self.pr_commits[-1] if self.pr_commits else SimpleNamespace(sha=self.sha, html_url="")
             self.last_commit_id = self.last_commit
             self.base_sha = self.pr.base.sha if self.pr.base.sha else ""
             self.base_ref = self.pr.base.ref if self.pr.base.ref else ""
@@ -100,6 +104,62 @@ class GiteaProvider(GitProvider):
             self.enabled_issue = True
         else:
             self.pr_commits = None
+
+    @staticmethod
+    def _get_value(data: Any, key: str, default: Any = None) -> Any:
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
+
+    @classmethod
+    def _parse_datetime(cls, value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _normalize_commit(cls, commit: Any) -> SimpleNamespace:
+        commit_body = cls._get_value(commit, "commit", {}) or {}
+        author = cls._get_value(commit_body, "author", {}) or {}
+        files = []
+        for file_data in cls._get_value(commit, "files", []) or []:
+            files.append(SimpleNamespace(
+                filename=cls._get_value(file_data, "filename", ""),
+                status=cls._get_value(file_data, "status", ""),
+            ))
+
+        return SimpleNamespace(
+            sha=cls._get_value(commit, "sha", ""),
+            html_url=cls._get_value(commit, "html_url", ""),
+            commit=SimpleNamespace(
+                message=cls._get_value(commit_body, "message", ""),
+                author=SimpleNamespace(
+                    date=cls._parse_datetime(cls._get_value(author, "date") or cls._get_value(commit, "created")),
+                ),
+            ),
+            files=files,
+        )
+
+    @classmethod
+    def _normalize_commits(cls, commits: Any) -> List[SimpleNamespace]:
+        normalized_commits = [cls._normalize_commit(commit) for commit in commits or []]
+        return sorted(
+            normalized_commits,
+            key=lambda commit: commit.commit.author.date or datetime.min,
+        )
+
+    @classmethod
+    def _normalize_comment(cls, comment: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            body=cls._get_value(comment, "body", ""),
+            html_url=cls._get_value(comment, "html_url", ""),
+            created_at=cls._parse_datetime(cls._get_value(comment, "created_at")),
+        )
 
     def __add_file_content(self):
         for file in self.git_files:
@@ -228,6 +288,65 @@ class GiteaProvider(GitProvider):
 
     def get_comment_url(self, comment) -> str:
         return comment.html_url
+
+    def get_incremental_commits(self, incremental=IncrementalPR(False)):
+        self.incremental = incremental
+        if self.incremental.is_incremental:
+            self.unreviewed_files_set = dict()
+            self._get_incremental_commits()
+
+    def _get_incremental_commits(self):
+        if not self.pr_commits:
+            self.pr_commits = self._normalize_commits(self.repo_api.get_pr_commits(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number,
+            ))
+
+        self.previous_review = self.get_previous_review(full=True, incremental=True)
+        if self.previous_review:
+            self.incremental.commits_range = self.get_commit_range()
+            for commit in self.incremental.commits_range:
+                if commit.commit.message.startswith(f"Merge branch '{self.base_ref}'"):
+                    self.logger.info(f"Skipping merge commit {commit.commit.message}")
+                    continue
+                for file_data in commit.files:
+                    if file_data.filename:
+                        self.unreviewed_files_set[file_data.filename] = file_data
+        else:
+            self.logger.info("No previous review found, will review the entire PR")
+            self.incremental.commits_range = []
+            self.incremental.is_incremental = False
+
+    def get_commit_range(self):
+        last_review_time = self.previous_review.created_at
+        first_new_commit_index = None
+        for index in range(len(self.pr_commits) - 1, -1, -1):
+            commit_date = self.pr_commits[index].commit.author.date
+            if last_review_time and commit_date and commit_date > last_review_time:
+                self.incremental.first_new_commit = self.pr_commits[index]
+                first_new_commit_index = index
+            else:
+                self.incremental.last_seen_commit = self.pr_commits[index]
+                break
+        return self.pr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
+
+    def get_previous_review(self, *, full: bool, incremental: bool):
+        if not (full or incremental):
+            raise ValueError("At least one of full or incremental must be True")
+
+        if not getattr(self, "comments", None):
+            self.comments = [self._normalize_comment(comment) for comment in self.get_issue_comments()]
+
+        prefixes = []
+        if full:
+            prefixes.append(PRReviewHeader.REGULAR.value)
+        if incremental:
+            prefixes.append(PRReviewHeader.INCREMENTAL.value)
+
+        for index in range(len(self.comments) - 1, -1, -1):
+            if any(self.comments[index].body.startswith(prefix) for prefix in prefixes):
+                return self.comments[index]
 
     def publish_persistent_comment(self, pr_comment: str,
                                    initial_header: str,
@@ -442,6 +561,14 @@ class GiteaProvider(GitProvider):
             filepath=filename
         )
 
+    def _get_file_content_from_commit(self, filename: str, commit_sha: str) -> str:
+        return self.repo_api.get_file_content(
+            owner=self.owner,
+            repo=self.repo,
+            commit_sha=commit_sha,
+            filepath=filename
+        )
+
     def get_diff_files(self) -> List[FilePatchInfo]:
         """Get files that were modified in the PR"""
         if self.diff_files:
@@ -457,6 +584,9 @@ class GiteaProvider(GitProvider):
 
             if not is_valid_file(filename):
                 invalid_files_names.append(filename)
+                continue
+
+            if self.incremental.is_incremental and self.unreviewed_files_set and filename not in self.unreviewed_files_set:
                 continue
 
             counter_valid += 1
@@ -477,7 +607,10 @@ class GiteaProvider(GitProvider):
                 head_file = self.file_contents.get(filename,"")
 
             if self.incremental.is_incremental and self.unreviewed_files_set:
-                base_file = self._get_file_content_from_latest_commit(filename)
+                base_file = self._get_file_content_from_commit(
+                    filename,
+                    self.incremental.last_seen_commit_sha or self.base_sha,
+                )
                 self.unreviewed_files_set[filename] = patch
             else:
                 if avoid_load:

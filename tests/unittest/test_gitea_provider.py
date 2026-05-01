@@ -1,5 +1,10 @@
+from datetime import datetime
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from pr_agent.git_providers.git_provider import IncrementalPR
+from pr_agent.git_providers.gitea_provider import GiteaProvider
 
 
 class TestGiteaProvider:
@@ -103,3 +108,67 @@ class TestGiteaProvider:
         args, kwargs = mock_api_client.call_api.call_args
         assert args[0] == '/repos/owner/repo/pulls/123/commits'
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
+
+    def test_gitea_incremental_commits_uses_previous_review(self):
+        provider = object.__new__(GiteaProvider)
+        provider.logger = MagicMock()
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = 1
+        provider.base_ref = "main"
+        provider.unreviewed_files_set = {}
+        provider.pr_commits = GiteaProvider._normalize_commits([
+            {
+                "sha": "new",
+                "html_url": "https://gitea.local/owner/repo/commit/new",
+                "created": "2026-04-30T19:02:02Z",
+                "commit": {
+                    "message": "add average helper\n",
+                    "author": {"date": "2026-04-30T19:02:02Z"},
+                },
+                "files": [{"filename": "src/calculator.py", "status": "modified"}],
+            },
+            {
+                "sha": "old",
+                "html_url": "https://gitea.local/owner/repo/commit/old",
+                "created": "2026-04-30T18:59:59Z",
+                "commit": {
+                    "message": "add calculator helpers\n",
+                    "author": {"date": "2026-04-30T18:59:59Z"},
+                },
+                "files": [{"filename": "src/calculator.py", "status": "added"}],
+            },
+        ])
+        provider.get_previous_review = MagicMock(
+            return_value=SimpleNamespace(
+                created_at=datetime(2026, 4, 30, 19, 0, 40),
+                html_url="https://gitea.local/owner/repo/pulls/1#issuecomment-117",
+            )
+        )
+
+        incremental = IncrementalPR(True)
+
+        provider.get_incremental_commits(incremental)
+
+        assert incremental.is_incremental
+        assert incremental.first_new_commit_sha == "new"
+        assert incremental.last_seen_commit_sha == "old"
+        assert [commit.sha for commit in incremental.commits_range] == ["new"]
+        assert list(provider.unreviewed_files_set) == ["src/calculator.py"]
+
+    def test_gitea_incremental_commits_falls_back_without_previous_review(self):
+        provider = object.__new__(GiteaProvider)
+        provider.logger = MagicMock()
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = 1
+        provider.unreviewed_files_set = {}
+        provider.pr_commits = []
+        provider.get_previous_review = MagicMock(return_value=None)
+
+        incremental = IncrementalPR(True)
+
+        provider.get_incremental_commits(incremental)
+
+        assert not incremental.is_incremental
+        assert incremental.commits_range == []
